@@ -259,6 +259,19 @@ jobs:
               --catenary-config catenaryconfig.toml \
               --database-url "$DATABASE_URL" | tee "temp/${name}-early-pruning.md"
           done
+      - name: Benchmark Early Pruning on 1000 random SoCal queries
+        run: |
+          set -euo pipefail
+          psql "$DATABASE_URL" -Atc "copy (select st_y(point), st_x(point) from gtfs.stops where point is not null and location_type = 0) to stdout with csv" > temp/socal-stops.csv
+          python3 tools/generate-random-queries.py --stops temp/socal-stops.csv \
+            --output temp/random-queries.jsonl --count 1000 \
+            --first-date 2026-11-16 --days 7
+          python3 tools/benchmark-early-pruning-batch.py \
+            --binary target/release/edelweiss \
+            --queries temp/random-queries.jsonl --csv temp/ep-batch.csv -- \
+            --regions-config routing_regions.toml \
+            --catenary-config catenaryconfig.toml \
+            --database-url "$DATABASE_URL" | tee temp/ep-batch.md
       - name: Upload build metadata
         if: always()
         uses: actions/upload-artifact@v4
@@ -267,6 +280,9 @@ jobs:
           path: |
             temp/uci-cityhall-early-pruning.md
             temp/alhambra-pier-early-pruning.md
+            temp/random-queries.jsonl
+            temp/ep-batch.csv
+            temp/ep-batch.md
             compiled/routing/southern-california.bin
             temp/selection.json
             temp/timetable-file-sizes.log

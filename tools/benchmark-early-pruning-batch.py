@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Run many Edelweiss queries under each EDELWEISS_EARLY_PRUNING mode.
 
-Each query runs once per mode (off, pong, full) in a fresh process; mode order
-rotates per query. Itineraries are compared across modes for every query.
+One long-lived Edelweiss HTTP server is started per mode (off, pong, full), so
+process startup (OSR graph, indexes) is paid once, not per query. Each query is
+sent to every server sequentially; mode order rotates per query. Itineraries
+are compared across modes for every query.
 Writes a per-query CSV and prints/publishes an aggregate Markdown summary.
 
   python3 tools/benchmark-early-pruning-batch.py --binary target/release/edelweiss \
@@ -19,21 +21,48 @@ from pathlib import Path
 import statistics
 import subprocess
 import sys
-import tempfile
 import time
+import urllib.error
+import urllib.request
 
 MODES = ("off", "pong", "full")
 FIELDS = ("raptor_ms", "walking_ms", "route_scan_ms", "footpath_edges_examined", "query_total_ms")
 
 
-def run(command, mode, timings_path):
-    env = dict(os.environ, EDELWEISS_EARLY_PRUNING=mode)
-    p = subprocess.run(command, env=env, capture_output=True, text=True)
-    if p.returncode != 0:
-        return None, p.stderr.strip().splitlines()[-1:] or ["exit %d" % p.returncode]
-    response = json.loads(p.stdout)
+def start_servers(binary, extra, base_port):
+    servers = {}
+    for i, mode in enumerate(MODES):
+        port = base_port + i
+        env = dict(os.environ, EDELWEISS_EARLY_PRUNING=mode)
+        log = open(f"/tmp/edelweiss-{mode}.log", "w")
+        proc = subprocess.Popen([str(binary.resolve()), "--listen", f"127.0.0.1:{port}", *extra],
+                                env=env, stdout=log, stderr=subprocess.STDOUT)
+        servers[mode] = (proc, f"http://127.0.0.1:{port}")
+    deadline = time.monotonic() + 600
+    for mode, (proc, url) in servers.items():
+        while True:
+            if proc.poll() is not None:
+                raise RuntimeError(f"edelweiss ({mode}) exited during startup; see /tmp/edelweiss-{mode}.log")
+            try:
+                urllib.request.urlopen(url + "/health", timeout=2).read()
+                break
+            except (urllib.error.URLError, ConnectionError, TimeoutError):
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"edelweiss ({mode}) did not become healthy")
+                time.sleep(0.5)
+    return servers
+
+
+def run(url, body):
+    req = urllib.request.Request(url + "/v1/route", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=600) as r:
+            response = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return None, [e.read().decode(errors="replace")[:200]]
     stats = response["debugOutput"]["raptor"]
-    timings = json.loads(timings_path.read_text())
+    timings = response["debugOutput"]["timings"]
     row = {
         "raptor_ms": timings["raptor_ms"],
         "query_total_ms": timings["query_total_ms"],
@@ -61,7 +90,8 @@ def main():
     ap.add_argument("--queries", required=True, type=Path)
     ap.add_argument("--csv", required=True, type=Path)
     ap.add_argument("--limit", type=int, default=None)
-    ap.add_argument("--warmups", type=int, default=3)
+    ap.add_argument("--warmups", type=int, default=5)
+    ap.add_argument("--base-port", type=int, default=40600)
     ap.add_argument("edelweiss_args", nargs=argparse.REMAINDER)
     args = ap.parse_args()
     extra = args.edelweiss_args[1:] if args.edelweiss_args[:1] == ["--"] else args.edelweiss_args
@@ -71,22 +101,22 @@ def main():
 
     rows, errors, mismatches = [], [], []
     started = time.monotonic()
-    with tempfile.TemporaryDirectory() as tmp:
-        qpath, tpath = Path(tmp) / "q.json", Path(tmp) / "t.json"
-        command = [str(args.binary.resolve()), "--query", str(qpath), "--query-timings", str(tpath), *extra]
+    servers = start_servers(args.binary, extra, args.base_port)
+    print(f"servers ready after {time.monotonic() - started:.1f}s", file=sys.stderr, flush=True)
+    started = time.monotonic()
+    try:
         for i, q in enumerate(queries):
             body = {k: v for k, v in q.items() if k != "id"}
-            qpath.write_text(json.dumps(body))
             if i == 0:
                 for _ in range(args.warmups):
                     for mode in MODES:
-                        run(command, mode, tpath)
+                        run(servers[mode][1], body)
             shift = i % len(MODES)
             results, failed = {}, None
             for mode in MODES[shift:] + MODES[:shift]:
-                result, err = run(command, mode, tpath)
+                result, err = run(servers[mode][1], body)
                 if err:
-                    failed = f"{mode}: {err[0][:200]}"
+                    failed = f"{mode}: {err[0]}"
                     break
                 results[mode] = result
             if failed:
@@ -104,6 +134,11 @@ def main():
             if (i + 1) % 50 == 0:
                 print(f"{i + 1}/{len(queries)} queries, {len(errors)} errors, {len(mismatches)} mismatches, "
                       f"{time.monotonic() - started:.0f}s", file=sys.stderr, flush=True)
+    finally:
+        for proc, _ in servers.values():
+            proc.terminate()
+        for proc, _ in servers.values():
+            proc.wait(timeout=30)
 
     args.csv.parent.mkdir(parents=True, exist_ok=True)
     if rows:

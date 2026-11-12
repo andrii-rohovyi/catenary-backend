@@ -157,7 +157,7 @@ jobs:
           pid=$!
           trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
           for attempt in $(seq 1 120); do
-            if grep -q 'Opened native OSR mmap: north-america/us/california/socal' temp/osr-validation.log; then
+            if grep -Eq 'Opened native OSR [^:]*: north-america/us/california/socal' temp/osr-validation.log; then
               break
             fi
             if ! kill -0 "$pid" 2>/dev/null; then
@@ -166,7 +166,7 @@ jobs:
             fi
             sleep 1
           done
-          grep -q 'Opened native OSR mmap: north-america/us/california/socal' temp/osr-validation.log || {
+          grep -Eq 'Opened native OSR [^:]*: north-america/us/california/socal' temp/osr-validation.log || {
             cat temp/osr-validation.log
             exit 1
           }
@@ -277,6 +277,7 @@ jobs:
           path: |
             temp/uci-cityhall-early-pruning.md
             temp/alhambra-pier-early-pruning.md
+            compiled/routing/southern-california.bin
             temp/selection.json
             temp/timetable-file-sizes.log
             temp/stops.tsv

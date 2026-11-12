@@ -101,8 +101,11 @@ pub(crate) struct NigiriRaptor {
     pub(crate) stats_: RaptorStats,
     route_workers: usize,
     route_buffers: Vec<RouteBuffer>,
-    /// Footpath early pruning (see `update_footpaths`); only disabled by tests/benchmarks.
+    /// Footpath early pruning (see `update_footpaths`). Benchmarks select it
+    /// with `EDELWEISS_EARLY_PRUNING=full|pong|off` (default `full`).
     early_prune: bool,
+    /// `false` restores pong-only footpath pruning (`EDELWEISS_EARLY_PRUNING=pong`).
+    early_prune_ping: bool,
 }
 
 impl NigiriRaptor {
@@ -127,6 +130,16 @@ impl NigiriRaptor {
             route_workers > 0,
             "EDELWEISS_RAPTOR_WORKERS must be positive"
         );
+        let (early_prune, early_prune_ping) = match std::env::var("EDELWEISS_EARLY_PRUNING") {
+            Err(std::env::VarError::NotPresent) => (true, true),
+            Ok(value) => match value.as_str() {
+                "full" => (true, true),
+                "pong" => (true, false),
+                "off" => (false, false),
+                _ => anyhow::bail!("EDELWEISS_EARLY_PRUNING must be one of full, pong, off"),
+            },
+            Err(error) => return Err(error.into()),
+        };
         let target = tt.coordinates().len();
         ensure!(
             q.access
@@ -177,7 +190,8 @@ impl NigiriRaptor {
             bounds_last_k_: 0,
             stats_: stats,
             route_workers,
-            early_prune: true,
+            early_prune,
+            early_prune_ping,
             route_buffers: Vec::new(),
         })
     }
@@ -517,7 +531,7 @@ impl NigiriRaptor {
         }
     }
     fn update_footpaths(&mut self, tt: &ZeroCopyTimetable<'_>, k: usize) {
-        let prune = self.early_prune && self.bounds_last_k_ != 0;
+        let prune = self.early_prune && (self.early_prune_ping || self.bounds_last_k_ != 0);
         for from in self.prev_station_mark_.indices() {
             let tmp = self.tmp_[from];
             if tmp == self.invalid() {
@@ -529,15 +543,30 @@ impl NigiriRaptor {
                 tt.footpaths_from(LocationIdx(from as u32))
             };
             for fp in paths {
-                // Early pruning: footpaths are stored sorted by ascending walk
-                // time (validated on load), and every effective transfer
-                // duration is >= the raw walk time. Once even the raw walk
-                // cannot beat the destination bound for this round, neither
-                // this edge nor any later (longer) one can pass `reachable()`
-                // in `update_ready`, so the rest of the list is skipped.
-                // Not applied while ping round labels are being retained
-                // (`bounds_last_k_ == 0`): `update_ready` stores those labels
-                // before destination pruning, so skipping would change them.
+                // Early pruning (Rohovyi, Abuaisha, Walsh, WCTR 2026; OTP
+                // `StdTransferEarlyPruning`): footpaths are stored sorted by
+                // ascending walk time (validated on load), and every effective
+                // transfer duration is >= the raw walk time. Once even the raw
+                // walk cannot beat the destination bound, neither this edge nor
+                // any later (longer) one can pass `reachable()`, so the rest of
+                // the list is skipped.
+                //
+                // `time_at_dest_[k]` already holds both OTP bounds:
+                // - per-round, across iterations: it is retained between
+                //   successive pongs and seeded from earlier results
+                //   (`limit_time_at_dest`), like `bestDestArrivalByRound`;
+                // - within the current RAPTOR: `update_time_at_dest` folds each
+                //   round's destination arrival into all later rounds, like
+                //   `bestDestCurrentIteration`.
+                //
+                // Also applied to the first (ping) RAPTOR. There `update_ready`
+                // retains round labels before destination pruning for the pong
+                // bounds, so skipping drops labels strictly worse than
+                // `time_at_dest_[k]`. Those only feed bound rows >= k, used by
+                // pongs with >= k boardings whose anchor (ping destination time)
+                // is no worse than that bound; every pong label there is no
+                // worse than its anchor, so it is rejected at such a stop with
+                // or without the dropped label. Pong results are unchanged.
                 if prune
                     && better(
                         self.time_at_dest_[k],
@@ -1049,14 +1078,18 @@ mod parallel_tests {
     // Several footpaths per stop, stored by ascending duration as the compiler
     // and `validate()` require. Long edges that early pruning skips go to
     // targets that also have shorter alternatives or are simply far away.
-    fn with_dense_footpaths(mut tt: TimetableOwned, stops: usize) -> TimetableOwned {
+    fn with_dense_footpaths(tt: TimetableOwned, stops: usize) -> TimetableOwned {
+        with_footpaths(tt, stops, 6)
+    }
+
+    fn with_footpaths(mut tt: TimetableOwned, stops: usize, degree: u32) -> TimetableOwned {
         tt.footpaths_out.clear();
         tt.footpaths_in.clear();
         tt.footpaths_out_offsets = vec![0];
         tt.footpaths_in_offsets = vec![0];
         let mut incoming = vec![Vec::<(u32, u32)>::new(); stops];
         for from in 0..stops {
-            let mut edges: Vec<(u32, u32)> = (1..=6u32)
+            let mut edges: Vec<(u32, u32)> = (1..=degree)
                 .map(|d| {
                     (
                         (from as u32 + d * 7) % stops as u32,
@@ -1106,37 +1139,65 @@ mod parallel_tests {
             let anchor = q.departure_unix_seconds + if reverse { 4 * 3600 } else { 0 };
             pruned.reset_point_arrivals();
             full.reset_point_arrivals();
-            // Ping pass (no bounds): retained round labels must be untouched.
+            // Ping pass (first RAPTOR, no bounds): pruning is active. Search
+            // state and results are identical; retained round labels may only
+            // differ where both are strictly worse than the destination bound.
+            let ping_examined = (
+                pruned.stats_.footpath_edges_examined,
+                full.stats_.footpath_edges_examined,
+            );
             let limit = step_limit(anchor, reverse);
-            let a = pruned
+            let ping = pruned
                 .execute_point(&tt, &q, anchor, q.max_boardings, limit)
                 .unwrap();
             let b = full
                 .execute_point(&tt, &q, anchor, q.max_boardings, limit)
                 .unwrap();
-            assert!(!a.is_empty());
-            assert_eq!(frontier(&a), frontier(&b));
-            assert_eq!(pruned.round_times_, full.round_times_);
-            // Pong pass (with ping bounds): pruning is active.
-            let bounds_a = pruned.fill_ping_bounds(3);
-            let bounds_b = full.fill_ping_bounds(3);
+            assert!(!ping.is_empty());
+            assert_eq!(frontier(&ping), frontier(&b));
+            assert_eq!(pruned.best_, full.best_);
+            assert_eq!(pruned.time_at_dest_, full.time_at_dest_);
+            for k in 0..pruned.round_times_.len() {
+                let bound = pruned.time_at_dest_[k];
+                for (&x, &y) in pruned.round_times_[k].iter().zip(&full.round_times_[k]) {
+                    assert!(
+                        x == y || (better(bound, x, reverse) && better(bound, y, reverse)),
+                        "ping label within the destination bound changed: reverse={reverse} k={k}"
+                    );
+                }
+            }
+            assert!(
+                pruned.stats_.footpath_edges_examined - ping_examined.0
+                    < full.stats_.footpath_edges_examined - ping_examined.1,
+                "ping pass did not prune any footpath: reverse={reverse}"
+            );
+            // Pong passes exactly as pong.rs drives them: one per ping result,
+            // most boardings first, retaining arrivals between pongs.
+            let mut ping = ping;
+            ping.sort_by_key(|j| std::cmp::Reverse(j.boardings));
+            let bounds_a = pruned.fill_ping_bounds(ping[0].boardings);
+            let bounds_b = full.fill_ping_bounds(ping[0].boardings);
             pruned.flip_point_direction(&mut pruned_lb);
             full.flip_point_direction(&mut full_lb);
             pruned.set_ping_bounds(bounds_a);
             full.set_ping_bounds(bounds_b);
-            let anchor = anchor + if reverse { -1800 } else { 3 * 3600 };
-            let direction = pruned.reverse;
-            let limit = step_limit(anchor, direction);
-            let a = pruned.execute_point(&tt, &q, anchor, 3, limit).unwrap();
-            let b = full.execute_point(&tt, &q, anchor, 3, limit).unwrap();
-            assert_eq!(frontier(&a), frontier(&b));
-            assert_eq!(pruned.best_, full.best_);
-            assert_eq!(pruned.round_times_, full.round_times_);
-            assert_eq!(pruned.time_at_dest_, full.time_at_dest_);
+            for j in &ping {
+                let a = pruned
+                    .execute_point(&tt, &q, j.dest_time, j.boardings, j.start_time)
+                    .unwrap();
+                let b = full
+                    .execute_point(&tt, &q, j.dest_time, j.boardings, j.start_time)
+                    .unwrap();
+                assert!(!a.is_empty(), "pong lost ping result: reverse={reverse}");
+                assert_eq!(frontier(&a), frontier(&b));
+                assert_eq!(pruned.best_, full.best_);
+                assert_eq!(pruned.round_times_, full.round_times_);
+                assert_eq!(pruned.time_at_dest_, full.time_at_dest_);
+            }
             pruned.flip_point_direction(&mut pruned_lb);
             full.flip_point_direction(&mut full_lb);
         }
-        assert!(pruned.stats_.footpath_edges_examined <= full.stats_.footpath_edges_examined);
+        assert!(pruned.stats_.footpath_edges_examined < full.stats_.footpath_edges_examined);
     }
 
     #[test]
@@ -1280,6 +1341,102 @@ mod parallel_tests {
                 samples.sort_by(f64::total_cmp);
                 scans.sort_by(f64::total_cmp);
                 eprintln!("workers={workers} median_point_ms={:.3} median_route_scan_ms={:.3} parallel_rounds={}", samples[4], scans[4], state.stats_.parallel_route_scan_rounds);
+            });
+        }
+    }
+
+    /// Early pruning on/off over full PING/PONG cycles:
+    /// cargo test --release --manifest-path tools/raptor-check/Cargo.toml \
+    ///   benchmark_early_pruning -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn benchmark_early_pruning() {
+        #[derive(Clone, Copy, Debug)]
+        enum Mode {
+            Off,
+            PongOnly,
+            PingAndPong,
+        }
+        let routes: usize = std::env::var("EP_ROUTES").ok().map_or(160, |v| v.parse().unwrap());
+        let stops: usize = std::env::var("EP_STOPS").ok().map_or(256, |v| v.parse().unwrap());
+        let degree: u32 = std::env::var("EP_DEGREE").ok().map_or(32, |v| v.parse().unwrap());
+        let bytes = with_footpaths(network(routes, stops), stops, degree)
+            .encode()
+            .unwrap();
+        let tt = ZeroCopyTimetable::new(&bytes).unwrap();
+        let topology = LowerBoundTopology::build(&tt);
+        let q = query(stops);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        eprintln!("routes={routes} stops={stops} footpaths_per_stop={degree}");
+        let mut baseline: Option<Vec<Vec<(i64, i64, usize)>>> = None;
+        let mut off_median = 0.0;
+        for mode in [Mode::Off, Mode::PongOnly, Mode::PingAndPong] {
+            pool.install(|| {
+                let mut state = NigiriRaptor::new(&tt, &q, false, Some(&topology)).unwrap();
+                state.route_workers = 1;
+                state.early_prune = !matches!(mode, Mode::Off);
+                state.early_prune_ping = matches!(mode, Mode::PingAndPong);
+                let mut other_lb = vec![0; tt.coordinates().len()];
+                let mut totals = Vec::new();
+                let mut walks = Vec::new();
+                let mut edges = Vec::new();
+                for run in 0..13 {
+                    let (walk0, edges0) = (state.stats_.walking_ms, state.stats_.footpath_edges_examined);
+                    let mut signature = Vec::new();
+                    let start = Instant::now();
+                    for reverse in [false, true] {
+                        for slot in 0..8 {
+                            if state.reverse != reverse {
+                                state.flip_point_direction(&mut other_lb);
+                            }
+                            let anchor = q.departure_unix_seconds
+                                + slot * 600
+                                + if reverse { 4 * 3600 } else { 0 };
+                            state.reset_point_arrivals();
+                            let mut ping = state
+                                .execute_point(&tt, &q, anchor, q.max_boardings, step_limit(anchor, reverse))
+                                .unwrap();
+                            if ping.is_empty() {
+                                continue;
+                            }
+                            ping.sort_by_key(|j| std::cmp::Reverse(j.boardings));
+                            let bounds = state.fill_ping_bounds(ping[0].boardings);
+                            state.flip_point_direction(&mut other_lb);
+                            state.set_ping_bounds(bounds);
+                            for j in &ping {
+                                let pong = state
+                                    .execute_point(&tt, &q, j.dest_time, j.boardings, j.start_time)
+                                    .unwrap();
+                                signature.push(frontier(&pong));
+                            }
+                            state.flip_point_direction(&mut other_lb);
+                        }
+                    }
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                    match &baseline {
+                        Some(expected) => assert_eq!(&signature, expected, "{mode:?} changed pong results"),
+                        None => baseline = Some(signature),
+                    }
+                    if run >= 3 {
+                        totals.push(elapsed);
+                        walks.push(state.stats_.walking_ms - walk0);
+                        edges.push(state.stats_.footpath_edges_examined - edges0);
+                    }
+                }
+                totals.sort_by(f64::total_cmp);
+                walks.sort_by(f64::total_cmp);
+                let median = totals[totals.len() / 2];
+                if matches!(mode, Mode::Off) {
+                    off_median = median;
+                }
+                eprintln!(
+                    "{:<12} median_total_ms={:>8.3} median_walking_ms={:>8.3} footpath_edges={:>9} speedup_vs_off={:.3}x",
+                    format!("{mode:?}"),
+                    median,
+                    walks[walks.len() / 2],
+                    edges[0],
+                    off_median / median,
+                );
             });
         }
     }
